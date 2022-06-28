@@ -1,0 +1,309 @@
+---
+title: "HZBio Biopsy Quality Analysis - DMPK PSET2"
+author: "Aaron Yu"
+date: "06/23/2022"
+output: html_document
+---
+##1. Load packages
+```{r echo = FALSE}
+suppressPackageStartupMessages({
+  library(NanoStringQCPro)
+  ##library(NanoStringNorm)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(PoiClaClu)
+  library(ggplot2)
+  library(vsn)
+  library(gplots)
+  library(hexbin)
+  library(gtools)
+  library(dplyr)
+  library(stringr)
+  library(tidyr)
+  library(ggpubr)
+  library(aod)
+  library(boot)
+  library(caret)
+  library(psych)
+  library(e1071)
+  library(tidyverse)
+  library(ROSE)
+  library(car)
+  library(readxl)
+})
+```
+
+##2. Load and normalize HZBio Data
+```{r, echo = FALSE}
+
+##Load HZBio Data
+{
+  TestData_Raw <- read.csv(r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\Data\Nanostring\HZBio\DMPK_Pset2\2022.06.21 - HZBio DMPK Pset2 -RawCounts.csv}", row.names = 1, check.names = FALSE)
+  TestData_Norm <- read.csv(r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\Data\Nanostring\HZBio\DMPK_Pset2\2022.06.21 - HZBio DMPK Pset2 -NormCounts.csv}", row.names = 1, check.names = FALSE)
+  TestData_Platemap <- read.csv(r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\Data\Nanostring\HZBio\DMPK_Pset2\2022.06.21 - HZBio DMPK Pset2 -Platemaps.csv}", row.names = 1, check.names = FALSE)
+  
+  TestData_RawMerge <- as.data.frame(t(TestData_Raw))
+  TestData_RawMerge <- merge(TestData_Platemap, TestData_RawMerge, by = 0)
+  TestData_NormMerge <- as.data.frame(t(TestData_Norm))
+  TestData_NormMerge <- merge(TestData_Platemap, TestData_NormMerge, by = 0)
+}
+
+##Normalize HZBio Data
+## normalized data should only be normalized to positive controls and calibrator
+##function for content normalization
+contentNormalize <- function(TechNormData, tissue_colName = 'Tissue', HK_genes = '', TOIs = '', read_startCol = 1) {
+  ##subset tissue types and get tissues of interest (TOI)
+  TOIs_data <- TechNormData[TechNormData[[tissue_colName]] %in% TOIs,]
+  
+  ##organize data into subsets for each TOI (optional) and get HKG geomean
+  TOIs_data_HKG <- TOIs_data
+  TOIs_data_HKG[, 1:read_startCol] <- NULL     #remove unnecessary columns
+  TOIs_data_HKG <- TOIs_data_HKG[, colnames(TOIs_data_HKG) %in% HK_genes]
+  TOIs_data_HKG_geomeans <- apply(TOIs_data_HKG, 1, geometric.mean)
+  TOIs_data_HKG_geomeanAVG <- mean(TOIs_data_HKG_geomeans)
+  TOIs_data_HKG_scale <- sapply(TOIs_data_HKG_geomeans, function(x) TOIs_data_HKG_geomeanAVG/x)
+  
+  ##scale the data by the HKG scaling factor (content normalization)
+  TOIs_data_norm <-TOIs_data
+  TOIs_data_samplenames <- TOIs_data_norm[, 1:read_startCol]
+  TOIs_data_norm[, 1:read_startCol] <- NULL
+  samples <- nrow(TOIs_data_norm)
+  genes <- ncol(TOIs_data_norm)
+  TOIs_data_HKG_scale <- matrix(rep(TOIs_data_HKG_scale, times = genes), nrow = samples, ncol = genes)
+  TOIs_data_norm <- TOIs_data_HKG_scale*as.matrix(TOIs_data_norm)
+  TOIs_data_norm <- cbind(TOIs_data_samplenames, TOIs_data_norm)
+  return(TOIs_data_norm)
+}
+
+##normalize HZBio data
+{
+  HKGs <- c('IPO13_1', 'RER1_1','GHITM_1','TMBIM6_1','GTF2B_1','TXNIP_1','ENSMFAG00000010720_1')
+  tissue_types <- c('Gastroc', 'VA', 'Heart', 'Diaphragm', 'Adrenal', 'Liver', 'Kidney', 'Spleen')
+  TestData_TOIs <- c('Gastroc', 'VA')
+  TestData_tissue_colName <- 'Organ'
+  TestData_readStartCol <- 9
+  TestData_NormNorm <- contentNormalize(TestData_NormMerge, TestData_tissue_colName, HKGs, TestData_TOIs, TestData_readStartCol)
+}
+
+##Function for cleaning up data
+clean_data <- function(unclean_data, ctrl_genes = '', HK_genes = '', duplicate_probes = '', remove_additional = '') {
+  cleaned_data <- unclean_data
+  cleaned_data <- cleaned_data[, !colnames(cleaned_data) %in% ctrl_genes]
+  cleaned_data <- cleaned_data[, !colnames(cleaned_data) %in% HK_genes]
+  cleaned_data <- cleaned_data[, !colnames(cleaned_data) %in% duplicate_probes]
+  cleaned_data <- cleaned_data[, !colnames(cleaned_data) %in% remove_additional]
+  cleaned_data <- cleaned_data[!duplicated(cleaned_data$Sample), ]
+  rownames(cleaned_data) <- cleaned_data$Sample
+  return(cleaned_data)
+}
+
+ctrlNames <- c("POS_1","POS_2","POS_3","POS_4","POS_5","POS_6","POS_7","POS_8","NEG_1","NEG_2","NEG_3","NEG_4","NEG_5","NEG_6","NEG_7","NEG_8")
+dmpkRemove <- c("DMPK_1","DMPK_2","DMPK_3","DMPK_KD","Quality", "ENSMFAG00000035335_1")
+dupProb <- c("CD63_1","KRT14_3","MEST_2","TFRC_2","TRIM54_2","TRIM55_2","TRIM63_2")
+
+TestData_cleaned <- clean_data(TestData_NormNorm, ctrl_genes = ctrlNames, HK_genes = HKGs, duplicate_probes = dupProb, remove_additional = dmpkRemove)
+```
+
+##2.0 Read correct Cyno6 data
+```{r, echo=FALSE}
+#Set main working directory and sub directories, create if they do not exist
+{
+  Oliver_main_dir <- paste0("P:\\Research\\Lab\\data transfer\\Oliver\\Nanostring\\Analysis\\20201221_Cyno6")
+  
+  expression_dir <- paste0(Oliver_main_dir, "\\Expression")
+  ifelse(!dir.exists(file.path(Oliver_main_dir, "Expression")), dir.create(file.path(Oliver_main_dir, "\\Expression")), FALSE)
+  qc_dir <- paste0(Oliver_main_dir, "\\QC")
+  ifelse(!dir.exists(file.path(Oliver_main_dir, "QC")), dir.create(file.path(Oliver_main_dir, "QC")), FALSE)
+  Oliver_data_dir <- paste0(Oliver_main_dir, "\\data")
+  ifelse(!dir.exists(file.path(Oliver_main_dir, "data")), dir.create(file.path(Oliver_main_dir, "\\data")), FALSE)
+  
+  gene_list_dir <- "C:\\Data_Analysis\\Nanostring\\Gene_Lists"
+}
+##read Oliver's previous data which is HKG normalized and "cleaned"
+{
+  setwd(Oliver_data_dir)
+  Actual_Cyno6_data <- read.csv("cynoMusclePython.csv", row.names = 1)
+  Actual_Cyno6_data_read_startCol <- 5
+  Actual_Cyno6_tissue_colName <- 'Muscle'
+}
+
+##Define Heatmap Function
+heat <- function(dat, sym, title, cls){
+  marg = c(10,8) 
+  coldeg = 45
+  colramp = colorRampPalette(brewer.pal(11, "RdBu"))(256)
+  colramp = rev(colramp)
+  
+  set.seed(1)
+  d <- dist(dat, method = "euclidean")
+  fit <- hclust(d, method="ward.D2") #cluster data
+  
+  if(cls == "T"){
+    set.seed(1)
+    d_c <- dist(t(dat), method = "euclidean")
+    fit_c <- hclust(d_c, method="ward.D2") #cluster data
+    set.seed(1)
+    heatmap.2(as.matrix(dat), Rowv = as.dendrogram(fit), Colv = as.dendrogram(fit_c), 
+              dendrogram = "both", col = colramp, scale = "none", 
+              symm=sym,symkey=sym,symbreaks=sym, key = TRUE, keysize = 1.5, 
+              density.info = 'histogram', densadj = 0.25, cexCol = 1.2,
+              cexRow = 1, margins = marg, srtCol = coldeg, trace = "none",
+              main = title)
+  }else{
+    set.seed(1)
+    heatmap.2(as.matrix(dat), Rowv = as.dendrogram(fit), Colv = FALSE, 
+              dendrogram = "row", col = colramp, scale = "none", 
+              symm=sym,symkey=sym,symbreaks=sym, key = TRUE, keysize = 1.5, 
+              density.info = 'histogram', densadj = 0.25, cexCol = 1.2,
+              cexRow = 1, margins = marg, srtCol = coldeg, trace = "none",
+              main = title)
+  }
+}
+
+
+```
+
+##2.1 PCA & Gene Clustering
+```{r, echo=FALSE}
+library("ggfortify")
+{
+  quad <- Actual_Cyno6_data[Actual_Cyno6_data[[Actual_Cyno6_tissue_colName]] == 'QUAD', ]
+  ta <- Actual_Cyno6_data[Actual_Cyno6_data[[Actual_Cyno6_tissue_colName]] == 'TA', ]
+  gas <- Actual_Cyno6_data[Actual_Cyno6_data[[Actual_Cyno6_tissue_colName]] == 'GAS', ]
+}
+dmpkRemove <- c("DMPK_1","DMPK_2","DMPK_3","DMPK_KD","Quality", "ENSMFAG00000035335_1")
+{
+  Actual_Cyno6_data_ClusterSet <- Actual_Cyno6_data[!colnames(Actual_Cyno6_data) %in% dmpkRemove]
+  l <- length(Actual_Cyno6_data_ClusterSet)
+  Actual_Cyno6_data_ClusterSet <- Actual_Cyno6_data_ClusterSet[, (Actual_Cyno6_data_read_startCol+1):l]
+  Actual_Cyno6_data_ClusterSet <- t(Actual_Cyno6_data_ClusterSet)
+  Actual_Cyno6_data_ClusterSet <- log10(Actual_Cyno6_data_ClusterSet)
+  
+  pcaMuscleNorm <- prcomp(Actual_Cyno6_data_ClusterSet, scale.=TRUE)
+  autoplot(pcaMuscleNorm, label = TRUE, title = "PCA log10 Muscle, all genes")
+}
+{
+  q <- length(quad)
+  pca <- quad[, (Actual_Cyno6_data_read_startCol+1):q]
+  pca <- pca[!colnames(pca) %in% dmpkRemove]
+  pca <- log10(pca)
+  pca <- prcomp(pca, scale.=TRUE)
+  quad$Quality <- as.factor(quad$Quality)
+  autoplot(pca, label = TRUE, data = quad, colour = "Quality", main = "QUAD PCA") + scale_color_brewer(palette = "Set1")
+}
+{
+  q <- length(ta)
+  pca <- ta[, (Actual_Cyno6_data_read_startCol+1):q]
+  pca <- pca[!colnames(pca) %in% dmpkRemove]
+  pca <- log10(pca)
+  pca <- prcomp(pca, scale.=TRUE)
+  ta$Quality <- as.factor(ta$Quality)
+  autoplot(pca, label = TRUE, data = ta, colour = "Quality", main = "TA PCA") + scale_color_brewer(palette = "Set1")
+}
+{
+  q <- length(gas)
+  pca <- gas[, (Actual_Cyno6_data_read_startCol+1):q]
+  pca <- pca[!colnames(pca) %in% dmpkRemove]
+  pca <- log10(pca)
+  pca <- prcomp(pca, scale.=TRUE)
+  gas$Quality <- as.factor(gas$Quality)
+  autoplot(pca, label = TRUE, data = gas, colour = "Quality", main = "GAS PCA") + scale_color_brewer(palette = "Set1")
+}
+
+{
+  cmuscleClusterSet <- Actual_Cyno6_data_ClusterSet
+  hclust_matrix <- cmuscleClusterSet %>% 
+    # transpose the matrix so genes are as columns
+    t() %>% 
+    # apply scalling to each column of the matrix (genes)
+    scale() %>% 
+    # transpose back so genes are as rows again
+    t()
+}
+
+gene_dist <- dist(hclust_matrix)
+
+gene_hclust <- hclust(gene_dist, method = "complete")
+
+# The default `plot()` function can be used to produce a simple dendrogram
+plot(gene_hclust, hang = -1, cex = 0.6)
+
+{
+  gene_cluster <- cutree(gene_hclust, k = 10) %>% 
+    # turn the named vector into a tibble
+    enframe() %>% 
+    # rename some of the columns
+    rename(gene = name, cluster = value)
+  
+  head(gene_cluster)
+}
+```
+
+##2.3 Build Logit Model using BTG1, CS, MYH3, PON2
+``` {r, echo=FALSE}
+##Organize data for Logit
+{
+  l <- length(Actual_Cyno6_data)
+  logitSet <- Actual_Cyno6_data[, (Actual_Cyno6_data_read_startCol+1):l]
+  logitSetL <- log10(logitSet)
+  logitSet$PredictedQuality <- NA
+  logitSet <- cbind(logitSet, logitSetL)
+  logitSet$Quality <- as.factor(logitSet$Quality)
+  pcaData <- logitSet
+  muscleDE <- logitSet
+}
+
+##Training set
+train <- logitSet
+
+##Build Logit Model
+{
+  set.seed(1)
+  logit <- glm(Quality ~ MYH3_2 + PON2_1 + BTG1_1 + CS_1, data = train, family = binomial("logit"))      
+  summary(logit)
+  print(vif(logit))
+  plot(logit, which = 4, id.n = 3)
+}
+```
+
+##3. Test Logit Model
+``` {r, echo=FALSE}
+{
+  logitPredict <- function(test, pred, predictors) {
+    test$PredictedQuality <- predict(logit, newdata = test, type = "response")
+    test$Quality <- round(test$PredictedQuality) %>% as.factor()
+    
+    mydata <- test[, colnames(test) %in% pred]
+    mydata <- mydata %>%
+      mutate(logit = log(PredictedQuality/(1-PredictedQuality))) %>%
+      gather(key = "predictors", value = "predictor.value", -logit)
+    
+    print(ggplot(mydata, aes(as.factor(logit), as.factor(predictor.value)))+
+            geom_point(size = 0.5, alpha = 0.5) +
+            geom_smooth(method = "loess") + 
+            theme_bw() + 
+            facet_wrap(~predictors, scales = "free_y"))
+    {
+      pcaL <- test[,colnames(test) %in% predictors]
+      pcaL <- prcomp(pcaL, scale.=TRUE)
+      print(autoplot(pcaL, label = FALSE, data = test, colour = "Quality", main = paste("PCA:", paste(predictors, collapse = " "), sep = " ")) + scale_color_brewer(palette = "Set1"))
+    }
+    return(test)
+  }
+  {
+    testlogitSet = TestData_NormNorm
+    testlogitSet2 = TestData_NormNorm[!TestData_NormNorm$`Time (days)` == 0, ]
+    input_pred <- c("MYH3_2", "PON2_1", "BTG1_1", "CS_1","PredictedQuality")
+    input_predictors <- c("MYH3_2", "PON2_1", "BTG1_1", "CS_1")
+    TestData_Predicted <- logitPredict(testlogitSet, pred = input_pred, predictors = input_predictors) %>% clean_data(ctrl_genes = ctrlNames, remove_additional = 'Row.names')
+  }
+  
+  ##Save
+  save <- FALSE
+  if(save) {
+    folderpath <- r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\Data\Nanostring\HZBio\DMPK_Pset2\Analysis}"
+    filename <- r"{SERIALBIOPSY_ContentNorm_PredictionData.csv}"
+    write.csv(TestData_Predicted, paste(folderpath, filename, sep = r"{\}"))
+  }
+}
+```
