@@ -5,7 +5,7 @@ date: "06/23/2022"
 output: html_document
 ---
 ##1. Load packages
-```{r echo = FALSE}
+```{r, echo = FALSE}
 suppressPackageStartupMessages({
   library(NanoStringQCPro)
   ##library(NanoStringNorm)
@@ -39,7 +39,7 @@ suppressPackageStartupMessages({
 ##Load HZBio Data
 {
   TestData_Raw <- read.csv(r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\Data\Nanostring\HZBio\DMPK_Pset2\2022.06.21 - HZBio DMPK Pset2 -RawCounts.csv}", row.names = 1, check.names = FALSE)
-  TestData_Norm <- read.csv(r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\Data\Nanostring\HZBio\DMPK_Pset2\2022.06.21 - HZBio DMPK Pset2 -NormCounts.csv}", row.names = 1, check.names = FALSE)
+  TestData_Norm <- read.csv(r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\Data\Nanostring\HZBio\DMPK_Pset2\2022.06.21 - HZBio DMPK Pset2 -NormCountsPosCalOnly.csv}", row.names = 1, check.names = FALSE)
   TestData_Platemap <- read.csv(r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\Data\Nanostring\HZBio\DMPK_Pset2\2022.06.21 - HZBio DMPK Pset2 -Platemaps.csv}", row.names = 1, check.names = FALSE)
   
   TestData_RawMerge <- as.data.frame(t(TestData_Raw))
@@ -105,7 +105,7 @@ TestData_cleaned <- clean_data(TestData_NormNorm, ctrl_genes = ctrlNames, HK_gen
 ```
 
 ##2.0 Read correct Cyno6 data
-```{r, echo=FALSE}
+```{r, echo=FALSE, warning=FALSE}
 #Set main working directory and sub directories, create if they do not exist
 {
   Oliver_main_dir <- paste0("P:\\Research\\Lab\\data transfer\\Oliver\\Nanostring\\Analysis\\20201221_Cyno6")
@@ -249,8 +249,6 @@ plot(gene_hclust, hang = -1, cex = 0.6)
   logitSet$PredictedQuality <- NA
   logitSet <- cbind(logitSet, logitSetL)
   logitSet$Quality <- as.factor(logitSet$Quality)
-  pcaData <- logitSet
-  muscleDE <- logitSet
 }
 
 ##Training set
@@ -278,7 +276,7 @@ train <- logitSet
       mutate(logit = log(PredictedQuality/(1-PredictedQuality))) %>%
       gather(key = "predictors", value = "predictor.value", -logit)
     
-    print(ggplot(mydata, aes(as.factor(logit), as.factor(predictor.value)))+
+    print(ggplot(mydata, aes(logit, predictor.value))+
             geom_point(size = 0.5, alpha = 0.5) +
             geom_smooth(method = "loess") + 
             theme_bw() + 
@@ -295,14 +293,24 @@ train <- logitSet
     testlogitSet2 = TestData_NormNorm[!TestData_NormNorm$`Time (days)` == 0, ]
     input_pred <- c("MYH3_2", "PON2_1", "BTG1_1", "CS_1","PredictedQuality")
     input_predictors <- c("MYH3_2", "PON2_1", "BTG1_1", "CS_1")
-    TestData_Predicted <- logitPredict(testlogitSet, pred = input_pred, predictors = input_predictors) %>% clean_data(ctrl_genes = ctrlNames, remove_additional = 'Row.names')
+    TestData_Predicted <- logitPredict(testlogitSet, pred = input_pred, predictors = input_predictors)
+    TestData_Predicted <- clean_data(TestData_Predicted, ctrl_genes = ctrlNames, remove_additional = 'Row.names')
+  }
+  
+  {
+    set.seed(28)
+    k.train.control <- trainControl(method = "cv", number = 12)
+    kmodel <- train(Quality ~ BTG1_1 + PON2_1 + MYH3_2, data = train, method = "glm",
+                    trControl = k.train.control)
+    print(kmodel)
   }
   
   ##Save
   save <- FALSE
   if(save) {
     folderpath <- r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\Data\Nanostring\HZBio\DMPK_Pset2\Analysis}"
-    filename <- r"{SERIALBIOPSY_ContentNorm_PredictionData.csv}"
+    biopsy_type <- 'SERIALBIOPSY'
+    filename <- paste0(biopsy_type, '_ContentNorm_PredictionData.csv')
     write.csv(TestData_Predicted, paste(folderpath, filename, sep = r"{\}"))
   }
 }
