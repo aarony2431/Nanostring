@@ -1,0 +1,369 @@
+---
+title: "Cyno Biopsy Quality"
+author: "Aaron Yu"
+date: '2022-07-05'
+output: html_document
+---
+
+```{r setup, warning=FALSE, message=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+suppressWarnings({
+  library(stats)
+  library(glue)
+  library(tidyr)
+  library(fastmatch)
+  library(dplyr)
+  library(stringr)
+  library(ggplot2)
+  library(vsn)
+  library(gplots)
+  library(psych)
+  library(ggfortify)
+  library(tidyverse)
+  library(bigutilsr)
+  library(FactoMineR)
+  library(caret)
+  library(glmnet)
+  library(randomForest)
+  library(datasets)
+  library(car)
+})
+```
+
+```{r functions, echo=FALSE}
+ctrls.neg <- c("NEG_1","NEG_2","NEG_3","NEG_4","NEG_5","NEG_6","NEG_7","NEG_8")
+ctrls.pos <- c("POS_1","POS_2","POS_3","POS_4","POS_5","POS_6","POS_7","POS_8")
+ctrls.all <- c(ctrls.neg, ctrls.pos)
+
+##function to identify first gene column index
+getStartColumn <- function(data, gene) {
+  read_startCol <- unique(grep(gene, colnames(as.data.frame(data)), ignore.case = TRUE, value = FALSE))
+  return(read_startCol)
+}
+
+#thresholding function
+threshold <- function(df, use_neg_ctrls = FALSE, cutoff = 20, kill = FALSE) {
+  if (use_neg_ctrls) {
+    cutoff <- max(df[, colnames(df) %in% ctrls.neg])
+  }
+  df[df <= cutoff | df == Inf | df == -Inf | is.na(df)] <- ifelse(kill, 0, cutoff)
+  return(df)
+}
+
+##function for content normalization
+contentNormalize <- function(TechNormData, tissue_colName, HK_genes, TOIs = 'All', read_startCol_gene, separate_tissues = FALSE, highest_neg_ctrl = FALSE) {
+  ##subset tissue types and get tissues of interest (TOI)
+  TechNormData <- as.data.frame(TechNormData)
+  tissue_colName.grep <- unique(grep(paste(tissue_colName, collapse = '|'), colnames(TechNormData), ignore.case = TRUE, value = TRUE))
+  if (any(TOIs == "All")) {
+    TOIs <- unique(TechNormData[[tissue_colName.grep]]) %>% .[nzchar(.)] %>% .[. != 'Calibrator']
+  } else {
+    TOIs <- unique(grep(paste(TOIs, collapse = '|'), TechNormData[[tissue_colName.grep]], ignore.case = TRUE, value = TRUE))
+  }
+  TOIs_data <- TechNormData[TechNormData[[tissue_colName.grep]] %in% TOIs,]
+  TOIs_ctrls <- TOIs_data[, colnames(TOIs_data) %in% ctrls.all]
+  TOIs_data <- TOIs_data[, !colnames(TOIs_data) %in% ctrls.all]
+  read_startCol <- getStartColumn(TOIs_data, gene = read_startCol_gene)
+  
+  ##organize data into subsets for each TOI (optional) and get HKG geomean
+  if (separate_tissues) {
+    TOIs_data_norm <- lapply(TOIs, function(TOI) contentNormalize(TOIs_data, tissue_colName = tissue_colName.grep, 
+                                                                  HK_genes = HK_genes, TOIs = TOI, 
+                                                                  read_startCol_gene = read_startCol_gene, 
+                                                                  separate_tissues = FALSE)) %>% compact(.) 
+    TOIs_data_norm <- Reduce(rbind, TOIs_data_norm) 
+    return(TOIs_data_norm)
+  } else {
+    HKGsearch <- paste(HK_genes, collapse = '|')
+    HKGs <- unique(grep(HKGsearch, colnames(TechNormData), ignore.case = TRUE, value = TRUE))
+    TOIs_data_HKG <- threshold(TOIs_data, kill = TRUE)
+    TOIs_data_HKG[, 1:(read_startCol-1)] <- NULL     #remove unnecessary columns
+    needsNormalizing <- colnames(TOIs_data_HKG) %in% HKGs
+    if (!any(needsNormalizing)) {
+      return(cbind(TOIs_data, TOIs_ctrls))
+    } else {
+      TOIs_data_HKG <- TOIs_data_HKG[, needsNormalizing]
+      TOIs_data_HKG_geomeans <- apply(TOIs_data_HKG, 1, geometric.mean)
+      TOIs_data_HKG_geomeanAVG <- mean(TOIs_data_HKG_geomeans)
+      TOIs_data_HKG_scale <- sapply(TOIs_data_HKG_geomeans, function(x) TOIs_data_HKG_geomeanAVG/x)
+      
+      ##scale the data by the HKG scaling factor (content normalization)
+      TOIs_data_norm <-TOIs_data
+      TOIs_data_samplenames <- TOIs_data_norm[, 1:(read_startCol-1)]
+      TOIs_data_norm[, 1:(read_startCol-1)] <- NULL
+      TOIs_data_norm <- threshold(TOIs_data_norm, kill = TRUE)
+      samples <- nrow(TOIs_data_norm)
+      genes <- ncol(TOIs_data_norm)
+      TOIs_data_HKG_scale <- matrix(rep(TOIs_data_HKG_scale, times = genes), nrow = samples, ncol = genes)
+      TOIs_data_norm <- TOIs_data_HKG_scale*as.matrix(TOIs_data_norm) %>% as.data.frame(.)
+      TOIs_data_norm <- as.data.frame(lapply(TOIs_data_norm, function(x) round(x, digits = 2)))
+      TOIs_data_norm <- threshold(TOIs_data_norm, use_neg_ctrls = highest_neg_ctrl)
+      TOIs_data_norm <- cbind(TOIs_data_samplenames, TOIs_data_norm, TOIs_ctrls) %>% arrange(., Row, Column)
+      
+      return(TOIs_data_norm)
+    }
+  }
+}
+
+##Function for cleaning up data
+clean_data <- function(unclean_data, ctrl_genes = ctrls.all, HK_genes = c('IPO13_1', 'RER1_1','GHITM_1','TMBIM6_1','GTF2B_1','TXNIP_1','ENSMFAG00000010720_1'), duplicate_probes = '', remove_additional = '') {
+  cleaned_data <- unclean_data %>% .[, !colnames(.) %in% c(ctrl_genes, HK_genes, duplicate_probes, remove_additional)] %>% .[!duplicated(.$Sample), ]
+  rownames(cleaned_data) <- cleaned_data$Sample
+  return(cleaned_data)
+}
+
+##function for removing information columns
+getDataRemoveInformation <- function(data, fromCol = 1, toCol) {
+  returnData <- as.data.frame(data)
+  returnData[, fromCol:toCol] <- NULL
+  return(returnData)
+}
+
+#Function for predicting the logit and graphing the predictors and the following PCA
+logitPredict <- function(test, pred, predictors, quality_cutoff = 0.95) {
+  test$PredictedQuality <- predict(logit, newdata = test, type = "response") ##predicts chance of being good
+  test$Quality <- ifelse(test$PredictedQuality < (1 - quality_cutoff), 'Bad', 'Good') %>% as.factor()
+  
+  mydata <- test[, colnames(test) %in% pred]
+  mydata <- mydata %>%
+    mutate(logit = log(PredictedQuality/(1-PredictedQuality))) %>%
+    gather(key = "predictors", value = "predictor.value", -logit)
+  
+  print(ggplot(mydata, aes(logit, predictor.value))+
+          geom_point(size = 0.5, alpha = 0.5) +
+          geom_smooth(method = "loess") + 
+          theme_bw() + 
+          facet_wrap(~predictors, scales = "free_y"))
+  {
+    pcaL <- test[,colnames(test) %in% predictors]
+    pcaL <- prcomp(pcaL, scale.=TRUE)
+    print(autoplot(pcaL, label = FALSE, data = test, colour = "Quality", main = paste("PCA:", paste(predictors, collapse = " + "), sep = " ")) + scale_color_brewer(palette = "Set1"))
+  }
+  return(test)
+}
+
+#Function for transforming data only by log10
+log10Data <- function(data, startGene = 'A2M_1') {
+  returnData <- data
+  startCol <- getStartColumn(data, gene = startGene)
+  endCol <- ncol(returnData)
+  returnData[, startCol:endCol] <- log10(returnData[, startCol:endCol])
+  return(returnData)
+}
+```
+
+The following code is designed to identify biomarkers of poor quality muscle biopsies using an unbiased method and correlating these biomarkers with biopsy parameters (e.g. distance, time).
+
+## Data Sets
+```{r data, warning=FALSE}
+# Load the data and merge with platemap information
+dataDir <- r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\R\Unbiased Biopsy Quality\Tech. Norm. Nanostring Data}"
+setwd(dataDir)
+dataFiles <- dir(getwd(), full.names = FALSE, pattern = "\\.csv$")
+data <- lapply(dataFiles, function (x) as.data.frame(t(read.csv(x, row.names = 1, check.names = FALSE))))
+
+platemapDir <- r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\R\Unbiased Biopsy Quality\Platemaps}"
+setwd(platemapDir)
+platemapFiles <- dir(getwd(), full.names = FALSE, pattern = "\\.csv$")
+platemaps <- lapply(platemapFiles, function (x) read.csv(x, row.names = 1, check.names = FALSE))
+
+annotatedData <- mapply(cbind, platemaps, data, SIMPLIFY = FALSE)
+
+# Select the data and normalize to the HKGs
+TOI <- c('bicep', 'quad', 'ld', 'gastroc', 'ta', 'va')
+tissue_col <- c('Organ', 'Muscle', 'Tissue')
+HKGs <- c('GHITM_1', 'GTF2B_1', 'IPO13_1', 'PPIB_1', 'RER1_1', 'SDHA_1', 'TMBIM6_1', 'TXNIP_1')
+startGene <- 'A2M_1'
+annotatedData_norm <- lapply(annotatedData, function(x) contentNormalize(x, TOIs = TOI, read_startCol_gene = startGene, separate_tissues = TRUE, tissue_colName = tissue_col, HK_genes = HKGs))
+
+annotatedData_clean <- lapply(annotatedData_norm, clean_data)
+```
+
+The following data sets were detected:
+`r paste(rep("\n-", length(dataFiles)), dataFiles)`
+
+The following platemaps were detected:
+`r paste(rep("\n-", length(platemapFiles)), platemapFiles)`
+
+## PCA Grouping
+
+We first generate a PCA plot of all the samples with using the same Nanostring probe set to look for sample grouping.
+
+```{r PCA}
+allData <- lapply(annotatedData_clean, function(x) getDataRemoveInformation(x, toCol = getStartColumn(x, gene = startGene)-1))
+genes <- Reduce(intersect, lapply(allData, colnames))
+pcaData <- lapply(allData, function(data) {
+  log10(data) %>% as.data.frame(.) %>% .[, colnames(.) %in% genes]
+  }) %>% Reduce(rbind, .)
+pca <- prcomp(pcaData, scale. = TRUE)
+autoplot(pca, labels = FALSE, main = glue('PCA All DMPK ProbeSet2 Biopsies\nN = {nrow(pcaData)}'))
+
+```
+
+Next, we compute the multivariate distance based on all Principal Components (PCs) of each point and the Local Outlier Factor (LOF; Breunig et al. 2000), the latter of which describes the likeliness of a point being an outlier based on the number of neighboring points. The LOF assumes a "normal" data set with grouping and empty bins separating outliers from the main data set. We can use either plots of the distance against the LOF with Tukey's rule correcting for skewness and multiple testing or use a robust method to identify a criterion for outliers based on the histogram plot of the multivariate distance and/or LOF.
+
+```{r cutoff}
+options(mc_doScale_quiet=TRUE)
+U <- pca$x
+llof <- LOF(U)
+llof[which(is.nan(llof))] <- 0
+llof[which(is.infinite(llof))] <- 1
+dist <- dist_ogk(U)
+qplot(dist, llof, main = "Correlation of Multivariate Distance with LOF") +
+  geom_vline(xintercept = tukey_mc_up(dist), color = "red") +
+  geom_hline(yintercept = tukey_mc_up(llof),  color = "red")
+hist(dist, breaks = nclass.scottRob, main = "Histogram of Multivariate Distance")
+dist_v = hist_out(dist)
+abline(v = dist_v$lim[2], col = "red")
+hist(llof, breaks = nclass.scottRob, main = "Histogram of LOF")
+llof_v = hist_out(llof)
+abline(v = llof_v$lim[2], col = "red")
+```
+
+Based on these analyses, we will use the LOF as the basis for outliers, with its default parameters and nearest-neighbors. Assigning samples with LOFs outside of the "normal" region as poor quality yields the following PCA plot:
+
+```{r LOF and PCA with Quality}
+analysisType<- 'MVD'
+separationData <- dist
+divider <- dist_v
+
+divider.min <- min(divider$lim)
+divider.max <- max(divider$lim)
+qualityData <- pcaData
+qualityData[, analysisType] <- separationData
+##qualityData$Quality <- ifelse(!between(qualityData[, analysisType], divider.min, divider.max), 'Bad', 'Good')
+qualityData$Quality <- rbind(llof, dist) %>% as.data.frame(.) %>% lapply(., function(point) {ifelse(point[1] < tukey_mc_up(llof) && point[2] < tukey_mc_up(dist), 'Good', 'Bad')}) %>% as.data.frame(.) %>% t()
+n_badQuality <- sum(qualityData$Quality == 'Bad', na.rm = TRUE)
+qualityData$Quality <- as.factor(qualityData$Quality)
+autoplot(pca, label = FALSE, data = qualityData[, which(colnames(qualityData) != analysisType)], colour = 'Quality', main = glue('PCA All DMPK ProbeSet2 Biopsies\nGood Quality N = {nrow(pcaData) - n_badQuality}\nPoor Quality N = {n_badQuality}')) + scale_color_brewer(palette = "Set1")
+
+save <- FALSE
+if (save) {
+  filename <- file.path(r"{C:\Users\ayu\OneDrive - Avidity Biosciences\Documents\R\Unbiased Biopsy Quality}", "QualityData.csv")
+  write.csv(qualityData, file = filename)
+}
+
+learningData <- qualityData[, which(colnames(qualityData) != analysisType)]
+```
+
+## Machine Learning Predictors
+
+Now that we've established an unbiased method which identified poor quality samples, we can use this grouping to identify genetic predictors of poor quality muscle biopsies. We will use the stepwise feature selection, elastic net, and random forest models to identify the top genetic predictors to generate a logistic model.
+
+# Stepwise Feature Selection
+
+```{r stepwise selection, warning=FALSE}
+stepwiseLogit <- glm(Quality ~., data = learningData, family = binomial)
+step.Logit <- step(stepwiseLogit, direction = "both", trace = FALSE)
+summary(step.Logit)    
+```
+
+It seems that none of the predictors are well-predictive with the step-wise regression. Thus, we will not use this model to base our analysis off of.
+
+# Elastic Net
+
+```{r elastic net, warning=FALSE}
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best, ]
+  rownames(best_result) = NULL
+  print(best_result)
+}
+
+set.seed(42)
+control <- trainControl(method = "repeatedcv", number = 12, repeats = 5)
+elnet <- train(Quality ~ ., data = learningData, method = "glmnet", trControl = control, tuneLength = 10)
+print(elnet)
+
+get_best_result(elnet)
+elnetimp <- varImp(elnet)
+elnetimp <- elnetimp$importance
+elnetimp <- elnetimp[order(-elnetimp), , drop = FALSE]
+print(elnetimp)
+```
+
+# Random Forest
+
+Identify the optimal number of variables sampled at each tree split, and run the Random Forest model with this number.
+
+```{r random forest, warning=FALSE}
+set.seed(69)
+sink("NUL")
+rf <- tuneRF(x = learningData[, which(colnames(learningData) != 'Quality')], learningData$Quality,
+       stepFactor = 0.5,
+       plot = TRUE,
+       ntreeTry = 500,
+       trace = FALSE,
+       improve = 0.05,
+       doBest = TRUE,
+       important = TRUE)
+sink()
+print(rf)
+rffimp <- varImp(rf)
+rffimp <- rffimp[order(-rffimp), , drop = FALSE]
+print(rffimp)
+```
+
+# Subsetting the Predictors from the Models
+
+We use the predictors identified from the Elastic Net and Random Forest models with cutoffs of 10% and 1, respectively, to identify common predictors to fit into a logistic model.
+
+```{r predictors}
+el_cutoff <- 10
+rf_cutoff <- 1
+el_rf_common_genes <- merge(
+  filter(elnetimp, Overall > el_cutoff), 
+  filter(rffimp, Overall > rf_cutoff), 
+  by = 'row.names')
+genes <- el_rf_common_genes$Row.names
+el_rf_common_genes$Row.names <- NULL
+rownames(el_rf_common_genes) <- genes
+colnames(el_rf_common_genes) <- c('Elastic Net', 'Random Forest')
+
+# Build Logit Model
+logit_formula <- as.formula(paste0('Quality ~ ', paste(rownames(el_rf_common_genes), collapse = ' + ')))
+set.seed(1)
+logit <- glm(logit_formula, data = qualityData, family = binomial('logit'))
+summary(logit)
+print(vif(logit))
+```
+
+# Creating the Logit Model with the Predictors
+We have identified the following `r nrow(el_rf_common_genes)` predictor genes using an unbiased cutoff:
+`r paste(rep("\n-", nrow(el_rf_common_genes)), rownames(el_rf_common_genes))`
+
+and used these genes to form the following Logit Model which predicts the training data as shown in the PCA plot.
+
+```{r logitpredict, warning=FALSE}
+input_predictors <- c(rownames(el_rf_common_genes))
+input_pred <- c(input_predictors, 'PredictedQuality')
+predicted <- logitPredict(pcaData, pred = input_pred, predictors = input_predictors, quality_cutoff = 0.95)
+
+#12-fold cross validation
+set.seed(28)
+k.train.control <- trainControl(method = "cv", number = 12)
+kmodel <- train(logit_formula, data = qualityData, method = "glm",
+                trControl = k.train.control)
+print(kmodel)
+```
+
+# Predicting Data
+
+Using the above generated Logit Model, we use it to predict the quality of a new test data set.
+
+```{r 1252.12 prediction}
+test.dataset <- r"{P:\Departments\Bioanalytical\1252.12 DM1 Cyno Chronic Tox\2022-05-10 Second Batch, Recovery Necropsy\Data\2022.07.15_NormalizedData_NoHKG.csv}"
+print(glue('Test File: {test.dataset}'))
+TestData_Norm <- read.csv(test.dataset, row.names = 1, check.names = FALSE)
+TestData_Platemap <- read.csv(r"{P:\Departments\Bioanalytical\1252.12 DM1 Cyno Chronic Tox\2022-05-10 Second Batch, Recovery Necropsy\Data\Platemap - BiopsyQC Nanostring.csv}", row.names = 1, check.names = FALSE, skipNul = TRUE)
+
+TestData_NormMerge <- as.data.frame(t(TestData_Norm))
+TestData_NormMerge <- cbind(TestData_Platemap, TestData_NormMerge)
+
+HKGs <- c('GHITM_1', 'GTF2B_1', 'IPO13_1', 'PPIB_1', 'RER1_1', 'SDHA_1', 'SSB_1', 'TMBIM6_1', 'TXNIP_1')
+
+TestData_NormNorm <- contentNormalize(TestData_NormMerge, TOIs = TOI, read_startCol_gene = startGene, separate_tissues = TRUE, tissue_colName = tissue_col, HK_genes = HKGs)
+TestData_cleaned <- log10Data(clean_data(TestData_NormNorm, HK_genes = HKGs, remove_additional = ''))
+TestData_predicted <- logitPredict(TestData_cleaned, pred = input_pred, predictors = input_predictors, quality_cutoff = 0.95)
+```
+
